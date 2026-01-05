@@ -1,0 +1,32 @@
+_format_version: "3.0"
+
+services:
+  - name: wordpress-service
+    host: wordpress_upstream
+    port: 80
+    protocol: http
+    retries: 5
+    connect_timeout: 60000
+    read_timeout: 60000
+    write_timeout: 60000
+    routes:
+      - name: wordpress-route
+        preserve_host: true
+        hosts:
+          - woocommerce-docker.local
+        protocols:
+          - http
+          - https
+
+upstreams:
+  - name: wordpress_upstream
+    algorithm: round-robin
+    targets:
+      - target: wordpress:80
+
+plugins:
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-ID
+      generator: uuid
+      echo_downstream: true

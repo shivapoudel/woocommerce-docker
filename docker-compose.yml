@@ -1,0 +1,146 @@
+
+name: woocommerce
+
+x-wordpress-common: &wordpress-common
+  build:
+    context: .
+    dockerfile: Dockerfile.wordpress
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_started
+  environment: &wordpress-env
+    WORDPRESS_DB_HOST: mysql:3306
+    WORDPRESS_DB_NAME: wordpress_db
+    WORDPRESS_DB_USER: wordpress
+    WORDPRESS_DB_PASSWORD: WpSecure@2026Pass
+    WORDPRESS_DEBUG: 1
+    WORDPRESS_CONFIG_EXTRA: |
+      /** Debugging mode */
+      define( 'WP_DEBUG_LOG', true );
+      define( 'WP_DEBUG_DISPLAY', false );
+      define( 'WP_DISABLE_FATAL_ERROR_HANDLER', true );
+
+      /** Custom site URL */
+      define( 'WP_HOME', 'https://woocommerce-docker.local' );
+      define( 'WP_SITEURL', 'https://woocommerce-docker.local' );
+
+      /** Redis Object Cache */
+      define( 'WP_REDIS_HOST', 'redis' );
+      define( 'WP_REDIS_PORT', 6379 );
+      define( 'WP_REDIS_PREFIX', 'woocommerce-docker.local:' );
+      define( 'WP_REDIS_DATABASE', 0 );
+      define( 'WP_REDIS_IGBINARY', true );
+      define( 'WP_REDIS_DISABLED', false );
+      define( 'WP_REDIS_PASSWORD', [ 'admin', 'password' ] );
+      define( 'WP_REDIS_DISABLE_BANNERS', true );
+      define( 'WP_REDIS_DISABLE_DROPIN_CHECK', true );
+      define( 'WP_REDIS_DISABLE_DROPIN_BANNERS', true );
+      define( 'WP_REDIS_DISABLE_DROPIN_AUTOUPDATE', true );
+
+      /** Duplicate Order Fix & Testing */
+      define( 'WC_CONCURRENT_CHECKOUT_TEST', true );  // Enable test button on checkout.
+      define( 'WC_CONCURRENT_CHECKOUT_REQUESTS', 5 ); // Number of a concurrent requests.
+
+      /** Keep pod IP stable (prefer the serving interface IP) */
+      $$_SERVER['REMOTE_ADDR'] = $$_SERVER['SERVER_ADDR'] ?? $$_SERVER['REMOTE_ADDR'];
+
+  volumes:
+    - ./wordpress:/var/www/html
+  extra_hosts:
+    - "woocommerce-docker.local:host-gateway"
+  deploy:
+    replicas: 3
+    resources:
+      limits:
+        cpus: '0.50'
+        memory: 512M
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: woocommerce-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: Secure@RootPass2026
+      MYSQL_DATABASE: wordpress_db
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: WpSecure@2026Pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    networks:
+      - woocommerce-net
+
+  redis:
+    image: redis:8-alpine
+    container_name: woocommerce-redis
+    command: ["redis-server", "--user", "default", "off", "--user", "admin", "on", ">password", "~*", "+@all"]
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - woocommerce-net
+
+  kong:
+    image: kong:3.9
+    container_name: woocommerce-kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl
+      KONG_SSL_CERT: /etc/kong/certs/cert.pem
+      KONG_SSL_CERT_KEY: /etc/kong/certs/key.pem
+      KONG_TRUSTED_IPS: 0.0.0.0/0,::/0
+      KONG_REAL_IP_HEADER: X-Forwarded-For
+      KONG_REAL_IP_RECURSIVE: "on"
+      KONG_DNS_ORDER: A,CNAME
+      KONG_DNS_STALE_TTL: -1
+      KONG_DNS_NOT_FOUND_TTL: 0
+      KONG_DNS_RESOLVER: 127.0.0.11
+    ports:
+      - "80:8000"
+      - "443:8443"
+      - "8001:8001"
+    volumes:
+      - "./kong.yml:/etc/kong/kong.yml:ro"
+      - "./certs:/etc/kong/certs:ro"
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    networks:
+      - woocommerce-net
+
+  wordpress:
+    <<: *wordpress-common
+    command: ["/usr/local/bin/wp-init.sh"]
+    healthcheck:
+      test: ["CMD", "wp", "--allow-root", "core", "is-installed"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    networks:
+      - woocommerce-net
+
+# Data stored in ./data folder (bind mounts) - persists across docker volume cleanup
+
+networks:
+  woocommerce-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

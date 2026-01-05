@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WooCommerce Duplicate Order Issue - Technical Report</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #1a1a2e;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background: #fff;
+        }
+        h1 { font-size: 28px; margin-bottom: 8px; color: #0f0f23; }
+        h2 { font-size: 20px; margin: 32px 0 16px; color: #16213e; border-bottom: 2px solid #e94560; padding-bottom: 8px; }
+        h3 { font-size: 16px; margin: 20px 0 12px; color: #0f3460; }
+        p { margin-bottom: 12px; }
+        .subtitle { color: #666; font-size: 14px; margin-bottom: 24px; }
+        .highlight { background: #fff3cd; border-left: 4px solid #e94560; padding: 16px; margin: 16px 0; }
+        .success { background: #d4edda; border-left: 4px solid #28a745; padding: 16px; margin: 16px 0; }
+        table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+        th, td { border: 1px solid #ddd; padding: 10px 12px; text-align: left; }
+        th { background: #f8f9fa; font-weight: 600; }
+        code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+        pre { background: #1a1f26; color: #e6edf3; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 13px; margin: 12px 0; }
+        .diagram { background: #f8f9fa; padding: 20px; border-radius: 8px; font-family: monospace; font-size: 12px; white-space: pre; overflow-x: auto; margin: 16px 0; }
+        .impact { color: #dc3545; font-weight: 600; }
+        .footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #666; }
+        @media print {
+            body { padding: 20px; }
+            .highlight, .success { break-inside: avoid; }
+            pre { break-inside: avoid; }
+        }
+    </style>
+</head>
+<body>
+
+<h1>WooCommerce Duplicate Order Issue</h1>
+<p class="subtitle">Technical Report — Load-Balanced Environments (Kong, AWS ALB, Kubernetes)</p>
+
+<div class="highlight">
+    <strong>Impact:</strong> <span class="impact">HIGH</span> — Customers charged multiple times for single checkout. Requires manual refunds and causes trust damage.
+</div>
+
+<h2>Architecture</h2>
+<div class="mermaid">
+flowchart TD
+    Browser[Browser]
+    Hosts[/"127.0.0.1<br/>woocommerce-docker.local"/]
+
+    subgraph Docker["woocommerce-net"]
+        Kong["Kong Gateway<br/>ports 80/443"]
+        MySQL["MySQL 8.4"]
+        Redis["Redis 8"]
+        WP1["WordPress Pod 1"]
+        WP2["WordPress Pod 2"]
+        WP3["WordPress Pod 3"]
+    end
+
+    Browser --> Hosts --> Kong
+    Kong -->|round-robin| WP1
+    Kong -->|round-robin| WP2
+    Kong -->|round-robin| WP3
+    WP1 --> MySQL
+    WP2 --> MySQL
+    WP3 --> MySQL
+    WP1 --> Redis
+    WP2 --> Redis
+    WP3 --> Redis
+</div>
+
+<h2>Executive Summary</h2>
+<p>WooCommerce creates multiple duplicate orders when concurrent checkout requests are processed by different pods. This occurs due to a race condition: multiple requests pass cart validation before any order is created, resulting in duplicate orders from a single checkout attempt.</p>
+
+<h2>The Problem</h2>
+
+<h3>Symptoms</h3>
+<ul style="margin-left: 20px; margin-bottom: 16px;">
+    <li>Multiple orders created from a single "Place Order" click</li>
+    <li>Orders appear within milliseconds of each other</li>
+    <li>Same customer, same cart, same total — but different order IDs</li>
+    <li>Payment gateway shows multiple successful charges</li>
+</ul>
+
+<h3>Root Cause: Race Condition</h3>
+<p>When multiple checkout requests arrive simultaneously (from AWS ALB retries, browser retries, or concurrent tabs), WooCommerce lacks atomic locking to prevent duplicate order creation:</p>
+
+<div class="diagram">
+Request 1 → Pod 1 → Check cart valid ✓ → Create Order #101
+Request 2 → Pod 2 → Check cart valid ✓ → Create Order #102 (DUPLICATE!)
+Request 3 → Pod 3 → Check cart valid ✓ → Create Order #103 (DUPLICATE!)
+
+All requests pass validation before any order exists in the database.
+Result: 3 orders created, customer charged 3 times!</div>
+
+<h3>Why This Happens</h3>
+<table>
+    <tr><th>Factor</th><th>Issue</th></tr>
+    <tr><td>Session Check</td><td><code>order_awaiting_payment</code> is set <em>after</em> order creation</td></tr>
+    <tr><td>No Cross-Pod State</td><td>Each pod has isolated PHP process and session</td></tr>
+    <tr><td>No Database Locking</td><td>Concurrent requests proceed without coordination</td></tr>
+    <tr><td>Race Condition Window</td><td>All requests pass validation before any order exists</td></tr>
+</table>
+
+<h3>Common Triggers</h3>
+<table>
+    <tr><th>Source</th><th>Behavior</th></tr>
+    <tr><td>AWS ALB/ELB</td><td>Retry on 5xx errors and connection failures</td></tr>
+    <tr><td>Kong Gateway</td><td>Connection errors trigger configurable retries</td></tr>
+    <tr><td>Browser Retries</td><td>User double-clicks or refreshes during processing</td></tr>
+    <tr><td>Payment Webhooks</td><td>Gateway sends duplicate notifications</td></tr>
+</table>
+
+<h2>The Fix</h2>
+
+<div class="success">
+    <strong>Solution:</strong> MySQL atomic locking using <code>GET_LOCK()</code> serializes concurrent requests so only one can create an order at a time.
+</div>
+
+<h3>How It Works</h3>
+<div class="diagram">
+Request 1 → Pod 1 → GET_LOCK('cart_hash') → ✓ Acquired → Create Order #101 → RELEASE_LOCK
+Request 2 → Pod 2 → GET_LOCK('cart_hash') → ⏳ Waiting...
+Request 3 → Pod 3 → GET_LOCK('cart_hash') → ⏳ Waiting...
+                                               │
+                           Lock released ──────┘
+                                               │
+Request 2 → Lock acquired → Order #101 exists (within 60s) → Blocked ✓
+Request 3 → Lock acquired → Order #101 exists (within 60s) → Blocked ✓
+
+Result: Only 1 order created, concurrent requests blocked</div>
+
+<h3>Implementation</h3>
+<p>The fix is implemented as a WordPress MU-plugin: <code>prevent-duplicate-orders.php</code></p>
+
+<pre>// 1. Create lock key from cart hash + email
+$lock_key = 'wc_checkout_' . md5( $cart_hash . $email );
+
+// 2. Acquire atomic lock (MySQL GET_LOCK, 30s timeout)
+$acquired = $wpdb->get_var( "SELECT GET_LOCK('$lock_key', 30)" );
+
+if ( ! $acquired ) {
+    throw new Exception( 'Order is being processed...' );
+}
+
+// 3. Check if order was JUST created with this cart hash (60s window)
+$existing = find_recent_order( $cart_hash, $email, 60 );
+if ( $existing ) {
+    throw new Exception( 'Order already placed.' );
+}
+
+// 4. Only one request proceeds - creates order
+
+// 5. Release lock after order created
+$wpdb->query( "SELECT RELEASE_LOCK('$lock_key')" );</pre>
+
+<p><strong>60-second window:</strong> After acquiring the lock, we check if an order was created within the last 60 seconds with the same cart hash. This catches concurrent requests while allowing legitimate repeat orders (same product purchased again after 60+ seconds).</p>
+
+<h2>Testing</h2>
+
+<h3>Test Environment</h3>
+<p>Docker Compose stack with Kong Gateway and multiple WordPress pods:</p>
+<ul style="margin-left: 20px; margin-bottom: 16px;">
+    <li>Kong Gateway (round-robin load balancing)</li>
+    <li>3 WordPress pods (shared MySQL database)</li>
+    <li>Redis for object caching</li>
+    <li>Concurrent Checkout Tester plugin for request simulation</li>
+</ul>
+
+<h3>Test Procedure</h3>
+<table>
+    <tr><th>Step</th><th>Action</th></tr>
+    <tr><td>1</td><td>Set <code>WC_DUPLICATE_ORDER_FIX</code> to <code>false</code> in wp-config.php</td></tr>
+    <tr><td>2</td><td>Restart WordPress containers</td></tr>
+    <tr><td>3</td><td>Add product to cart, fill checkout form</td></tr>
+    <tr><td>4</td><td>Click <strong>Run Concurrent Test</strong> button</td></tr>
+    <tr><td>5</td><td>Observe: Multiple orders = bug confirmed</td></tr>
+    <tr><td>6</td><td>Set constant to <code>true</code>, restart, repeat test</td></tr>
+    <tr><td>7</td><td>Observe: Single order = fix working</td></tr>
+</table>
+
+<h3>Manual Reproduction (Browser Console)</h3>
+<p>On the checkout page, open browser DevTools (F12) and paste:</p>
+<pre>const formData = new URLSearchParams(new FormData(document.querySelector('form.checkout')));
+const requests = Array(5).fill().map(() =>
+    fetch('/?wc-ajax=checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: formData,
+        credentials: 'same-origin'
+    }).then(r => r.json())
+);
+const results = await Promise.all(requests);
+console.log('Order IDs:', results.map(r => r.order_id).filter(Boolean));
+// Expected (with fix): [101] — 1 order
+// Actual (without fix): [101, 102, 103, 104, 105] — 5 duplicates!</pre>
+
+<h3>Configuration</h3>
+<pre>// wp-config.php or docker-compose.yml
+define( 'WC_DUPLICATE_ORDER_FIX', true );         // Enabled by default, set false to disable
+define( 'WC_CONCURRENT_CHECKOUT_TEST', true );    // Enable test button on checkout
+define( 'WC_CONCURRENT_CHECKOUT_REQUESTS', 5 );   // Concurrent requests to send</pre>
+
+<h2>Production Deployment</h2>
+
+<h3>Installation</h3>
+<ol style="margin-left: 20px; margin-bottom: 16px;">
+    <li>Copy <code>prevent-duplicate-orders.php</code> to <code>wp-content/mu-plugins/</code></li>
+    <li>Fix is enabled by default — no configuration required</li>
+    <li>To disable: <code>define( 'WC_DUPLICATE_ORDER_FIX', false );</code> in wp-config.php</li>
+</ol>
+
+<h3>Benefits</h3>
+<table>
+    <tr><th>Benefit</th><th>Description</th></tr>
+    <tr><td>Minimal Code</td><td>Simple lock/check/unlock — ~150 lines</td></tr>
+    <tr><td>Database Level</td><td>Works across all pods via shared MySQL</td></tr>
+    <tr><td>No Infrastructure Changes</td><td>No need to modify Kong or AWS ALB</td></tr>
+    <tr><td>Payment Gateway Safe</td><td>Prevents duplicate charges (Stripe, PayPal)</td></tr>
+    <tr><td>60-Second Window</td><td>Allows legitimate repeat orders after 60 seconds</td></tr>
+    <tr><td>Simple Toggle</td><td>Single constant to enable/disable</td></tr>
+</table>
+
+<h2>Files</h2>
+<table>
+    <tr><th>File</th><th>Purpose</th></tr>
+    <tr><td><code>prevent-duplicate-orders.php</code></td><td>The fix — atomic MySQL locking</td></tr>
+    <tr><td><code>concurrent-checkout-tester.php</code></td><td>Test UI — concurrent request simulation</td></tr>
+    <tr><td><code>docker-compose.yml</code></td><td>Multi-pod test environment</td></tr>
+    <tr><td><code>kong.yml</code></td><td>Kong Gateway configuration</td></tr>
+</table>
+
+<h2>References</h2>
+<ul style="margin-left: 20px;">
+    <li><a href="https://github.com/woocommerce/woocommerce/issues/62659">WooCommerce #62659</a> — Duplicate orders from concurrent checkout requests</li>
+    <li><a href="https://github.com/woocommerce/woocommerce/issues/10453">WooCommerce #10453</a> — Duplicate orders under load</li>
+    <li><a href="https://stripe.com/docs/api/idempotent_requests">Stripe Idempotency</a> — Request deduplication</li>
+    <li><a href="https://docs.konghq.com/gateway/latest/">Kong Gateway Docs</a> — Timeout and retry configuration</li>
+</ul>
+
+<div class="footer">
+    <p><strong>Version:</strong> 1.0.0 | <strong>Tested With:</strong> WooCommerce 10.4, WordPress 6.9, Kong 3.9 | <strong>Date:</strong> January 2026</p>
+</div>
+
+<script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+</body>
+</html>
