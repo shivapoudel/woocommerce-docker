@@ -27,6 +27,7 @@ In `prevent-duplicate-order.php`:
 ## The Issue
 
 If step 2 reads from replica:
+
 - The lock on master doesn't protect the read on replica
 - Replication lag means you might not see an order that was just created
 - Race condition: Two requests could both pass the duplicate check
@@ -42,6 +43,7 @@ HyperDB's read-after-write consistency should handle this, BUT there's a timing 
 ### Option 1: Trust HyperDB (Current Setup)
 
 HyperDB should route the duplicate check to master because:
+
 - The lock acquisition happens on master
 - HyperDB may track this connection and route subsequent reads to master
 
@@ -92,11 +94,13 @@ private static function find_recent_order( $cart_hash, $email, $lockout_duration
 To verify replication and lock behavior:
 
 1. **Check replication lag**:
+
    ```bash
    docker exec woocommerce-mysql-replica mysql -uroot -pSecure@RootPass2026 -e "SHOW REPLICA STATUS\G" | grep Seconds_Behind_Source
    ```
 
 2. **Test atomic locks**:
+
    - Run concurrent checkout requests
    - Check logs to see if duplicate orders are prevented
    - Monitor which server handles the duplicate check query
@@ -108,10 +112,12 @@ To verify replication and lock behavior:
 ## Configuration
 
 The `db-config.php` is now configured with:
+
 - Master: `write=1, read=2` (lower priority for reads)
 - Replica: `write=0, read=1` (higher priority for reads)
 
 This means:
+
 - All writes go to master
 - Reads prefer replica, but fallback to master
 - After a write, subsequent reads go to master (HyperDB behavior)
