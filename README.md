@@ -119,9 +119,9 @@ The checkout page includes an interactive **Concurrent Checkout Test** panel to 
 
 1. Add a product to your cart and go to the checkout page.
 2. Locate the test panel above the "Place Order" button.
-3. Toggle the **Fix ON/OFF** switch in the panel header:
-   - **Fix OFF**: Disables the atomic locking. A **0.5s delay** is injected to make race conditions easier to trigger.
-   - **Fix ON**: Enables atomic locking. Duplicate requests will be blocked with a yellow ⚠️ warning.
+3. Toggle the **Duplicate Protection** switch in the panel header:
+   - **Duplicate Protection: INACTIVE**: Disables the atomic locking. A **0.5s delay** is injected to make race conditions easier to trigger.
+   - **Duplicate Protection: ACTIVE**: Enables atomic locking. Duplicate requests will be blocked with a yellow ⚠️ warning.
 4. Click **Run Concurrent Test** to see the results in real-time.
 
 ### Manual Reproduction (Browser Console)

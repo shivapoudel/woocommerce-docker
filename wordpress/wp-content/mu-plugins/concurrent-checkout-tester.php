@@ -440,7 +440,7 @@ class Concurrent_Checkout_Tester {
 				<?php else : ?>
 					<label for="cct-fix-toggle" style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;margin:0;">
 						<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.025em;color:<?php echo $fix_enabled ? '#166534' : '#991b1b'; ?>;">
-							Fix <?php echo $fix_enabled ? 'ON' : 'OFF'; ?>
+							Duplicate Protection: <?php echo $fix_enabled ? 'Active' : 'Inactive'; ?>
 						</span>
 						<div style="position:relative;display:inline-block;width:34px;height:18px;">
 							<input type="checkbox" id="cct-fix-toggle" style="opacity:0;width:0;height:0;" <?php echo $fix_enabled ? 'checked' : ''; ?>>
@@ -451,7 +451,7 @@ class Concurrent_Checkout_Tester {
 				<?php endif; ?>
 			</div>
 			<p style="margin:8px 0 0;font-size:12px;color:#92400e;line-height:1.4;">
-				Sends <?php echo esc_html( $requests ); ?> concurrent requests. Stripe orders auto-update to Processing.
+				Sends <?php echo esc_html( $requests ); ?> concurrent checkout requests. Stripe orders set to Processing status.
 			</p>
 			<button type="button" id="cct-run-test" class="button alt" style="width:100%;margin-top:10px;">Run Concurrent Test</button>
 			<div id="cct-lockout-notice" style="display:none;width:100%;"></div>
