@@ -17,8 +17,9 @@ defined( 'ABSPATH' ) || exit;
  * Problem: Concurrent checkout requests (from retries, double-clicks, load balancers)
  * can create multiple orders because they all pass validation before any order exists.
  *
- * Solution: MySQL GET_LOCK() serializes concurrent requests. After acquiring the lock,
- * we check if an order was JUST created (within 60 seconds) with the same cart hash.
+ * Solution: Uses WordPress transients with atomic database operations for locking that
+ * works across all database connections (including HyperDB read replicas). After acquiring
+ * the lock, we check if an order was JUST created (within 60 seconds) with the same cart hash.
  * This catches concurrent requests while allowing legitimate repeat orders.
  *
  * @since 1.0.0
@@ -48,15 +49,26 @@ class Prevent_Duplicate_Orders {
 	}
 
 	/**
+	 * Get lockout duration in seconds.
+	 *
+	 * @since 1.0.0
+	 *
+	 * @return int Lockout duration in seconds.
+	 */
+	private static function get_lockout_duration() {
+		return defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
+	}
+
+	/**
 	 * Acquire atomic lock at start of checkout.
+	 *
+	 * Uses WordPress transients with atomic database operations for locking.
 	 *
 	 * @since 1.0.0
 	 *
 	 * @throws Exception If lock cannot be acquired or order was just created.
 	 */
 	public static function acquire_lock() {
-		global $wpdb;
-
 		if ( ! WC()->cart || WC()->cart->is_empty() ) {
 			return;
 		}
@@ -68,23 +80,22 @@ class Prevent_Duplicate_Orders {
 
 		// Use cart hash + customer identifier for lock key.
 		$email          = isset( $_POST['billing_email'] ) ? sanitize_email( wp_unslash( $_POST['billing_email'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification
-		self::$lock_key = 'wc_checkout_' . md5( $cart_hash . $email );
+		self::$lock_key = 'wc_checkout_lock_' . md5( $cart_hash . $email );
 
-		// Acquire lock - waits up to 30 seconds if another request has it.
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$acquired = $wpdb->get_var(
-			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, 30 )
-		);
+		// Get lockout duration for consistency.
+		$lockout_duration = self::get_lockout_duration();
 
-		if ( '1' !== $acquired ) {
+		// Check if lock already exists.
+		$existing_lock = get_transient( self::$lock_key );
+		if ( false !== $existing_lock ) {
 			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'woocommerce' ) );
 		}
 
-		// Clear the SQL result cache.
-		$wpdb->flush();
+		// Acquire lock by setting transient.
+		set_transient( self::$lock_key, time(), $lockout_duration );
 
-		// Use shared lockout duration.
-		$existing_order = self::find_recent_order( $cart_hash, $email );
+		// Check for duplicate order using the same lockout duration.
+		$existing_order = self::find_recent_order( $cart_hash, $email, $lockout_duration );
 		if ( $existing_order ) {
 			self::release_lock();
 			throw new Exception(
@@ -102,18 +113,18 @@ class Prevent_Duplicate_Orders {
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param string $cart_hash Cart hash to search for.
-	 * @param string $email     Customer email.
+	 * @param string $cart_hash        Cart hash to search for.
+	 * @param string $email            Customer email.
+	 * @param int    $lockout_duration Lockout duration in seconds.
 	 *
 	 * @return int|null Order ID if found, null otherwise.
 	 */
-	private static function find_recent_order( $cart_hash, $email ) {
+	private static function find_recent_order( $cart_hash, $email, $lockout_duration ) {
 		global $wpdb;
 
 		// Query HPOS tables - cart_hash is in operational_data table.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$lockout_duration = defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
-		$order_id         = $wpdb->get_var(
+		$order_id = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT o.id FROM {$wpdb->prefix}wc_orders o
 				INNER JOIN {$wpdb->prefix}wc_order_operational_data od ON o.id = od.order_id
@@ -132,7 +143,7 @@ class Prevent_Duplicate_Orders {
 	}
 
 	/**
-	 * Release the database lock.
+	 * Release the transient lock.
 	 *
 	 * @since 1.0.0
 	 */
@@ -141,10 +152,8 @@ class Prevent_Duplicate_Orders {
 			return;
 		}
 
-		global $wpdb;
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$wpdb->query( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::$lock_key ) );
+		// Delete transient lock.
+		delete_transient( self::$lock_key );
 
 		self::$lock_key = null;
 	}
