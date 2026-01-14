@@ -8,10 +8,13 @@ x-wordpress-common: &wordpress-common
   depends_on:
     mysql:
       condition: service_healthy
+    mysql-replica:
+      condition: service_healthy
     redis:
       condition: service_started
   environment: &wordpress-env
     WORDPRESS_DB_HOST: mysql:3306
+    WORDPRESS_DB_READ_HOST: mysql-replica:3306
     WORDPRESS_DB_NAME: wordpress_db
     WORDPRESS_DB_USER: wordpress
     WORDPRESS_DB_PASSWORD: WpSecure@2026Pass
@@ -66,14 +69,62 @@ services:
       MYSQL_DATABASE: wordpress_db
       MYSQL_USER: wordpress
       MYSQL_PASSWORD: WpSecure@2026Pass
+      MYSQL_REPLICATION_USER: replicator
+      MYSQL_REPLICATION_PASSWORD: Replicator@Pass2026
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
     ports:
       - "3306:3306"
     volumes:
       - ./data/mysql:/var/lib/mysql
+      - ./scripts/mysql-master-init.sql:/docker-entrypoint-initdb.d/01-master-init.sql:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pSecure@RootPass2026"]
       timeout: 20s
       retries: 10
+      interval: 10s
+    networks:
+      - woocommerce-net
+
+  mysql-replica:
+    image: mysql:8.4
+    container_name: woocommerce-mysql-replica
+    environment:
+      MYSQL_ROOT_PASSWORD: Secure@RootPass2026
+      MYSQL_DATABASE: wordpress_db
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: WpSecure@2026Pass
+      MYSQL_MASTER_HOST: mysql
+      MYSQL_MASTER_USER: replicator
+      MYSQL_MASTER_PASSWORD: Replicator@Pass2026
+      MYSQL_MASTER_PORT: 3306
+    command: >
+      --server-id=2
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --read-only=1
+      --relay-log=mysql-relay-bin
+      --relay-log-index=mysql-relay-bin.index
+      --relay-log-recovery=1
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./data/mysql-replica:/var/lib/mysql
+      - ./scripts/mysql-replica-init.sh:/docker-entrypoint-initdb.d/01-replica-init.sh:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pSecure@RootPass2026"]
+      timeout: 20s
+      retries: 10
+      interval: 10s
     networks:
       - woocommerce-net
 
