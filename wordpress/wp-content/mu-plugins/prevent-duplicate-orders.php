@@ -5,6 +5,7 @@
  * Author: Eachperson
  * Author URI: https://www.eachperson.com
  * Version: 1.0.0
+ * Text Domain: prevent-duplicate-orders
  *
  * @package prevent-duplicate-orders
  */
@@ -12,14 +13,11 @@
 defined( 'ABSPATH' ) || exit;
 
 /**
- * Atomic locking to prevent duplicate WooCommerce orders.
+ * Prevents duplicate orders from concurrent checkout requests using atomic locking.
  *
- * Problem: Concurrent checkout requests (from retries, double-clicks, load balancers)
- * can create multiple orders because they all pass validation before any order exists.
- *
- * Solution: MySQL GET_LOCK() serializes concurrent requests. After acquiring the lock,
- * we check if an order was JUST created (within 60 seconds) with the same cart hash.
- * This catches concurrent requests while allowing legitimate repeat orders.
+ * Uses MySQL's GET_LOCK() to serialize checkout processing for the same cart.
+ * If a concurrent request is detected (same cart hash within the lockout window),
+ * it blocks the duplicate attempt ensuring data integrity.
  *
  * @since 1.0.0
  */
@@ -35,24 +33,36 @@ class Prevent_Duplicate_Orders {
 	private static $lock_key = null;
 
 	/**
-	 * Initialize hooks.
+	 * Initialize the plugin.
 	 *
 	 * @since 1.0.0
 	 */
 	public static function init() {
-		if ( defined( 'WC_DUPLICATE_ORDER_FIX' ) && WC_DUPLICATE_ORDER_FIX ) {
-			add_action( 'woocommerce_checkout_process', [ __CLASS__, 'acquire_lock' ], 1 );
-			add_action( 'woocommerce_checkout_order_created', [ __CLASS__, 'release_lock' ], 99 );
-			register_shutdown_function( [ __CLASS__, 'release_lock' ] );
+		if ( ! defined( 'WC_DUPLICATE_ORDER_FIX' ) || ! WC_DUPLICATE_ORDER_FIX ) {
+			return;
 		}
+
+		// Registers actions to acquire/release locks during checkout.
+		add_action( 'woocommerce_checkout_process', [ __CLASS__, 'acquire_lock' ], 1 );
+		add_action( 'woocommerce_checkout_order_created', [ __CLASS__, 'release_lock' ], 99 );
+		register_shutdown_function( [ __CLASS__, 'release_lock' ] );
 	}
 
 	/**
-	 * Acquire atomic lock at start of checkout.
+	 * Acquire an atomic lock at the start of the checkout process.
+	 *
+	 * This method utilizes MySQL's GET_LOCK() function to enforce atomic,
+	 * connection-specific locking. This prevents race conditions where multiple
+	 * concurrent requests could otherwise validate and process the same cart
+	 * simultaneously.
+	 *
+	 * It also performs a critical check for existing orders created within the
+	 * configured lockout duration to block duplicate attempts.
 	 *
 	 * @since 1.0.0
 	 *
-	 * @throws Exception If lock cannot be acquired or order was just created.
+	 * @throws Exception If the lock cannot be obtained (timeout) or if a duplicate
+	 *                   order is detected immediately after acquiring the lock.
 	 */
 	public static function acquire_lock() {
 		global $wpdb;
@@ -68,52 +78,28 @@ class Prevent_Duplicate_Orders {
 
 		// Use cart hash + customer identifier for lock key.
 		$email          = isset( $_POST['billing_email'] ) ? sanitize_email( wp_unslash( $_POST['billing_email'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification
-		self::$lock_key = 'wc_checkout_' . md5( $cart_hash . $email );
+		self::$lock_key = 'wc_checkout_lock_' . md5( $cart_hash . $email );
 
-		// Acquire lock - waits up to 30 seconds if another request has it.
+		// Get lockout duration.
+		$lockout_duration = defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
+
+		// Acquire MySQL lock atomically.
+		// GET_LOCK() returns: 1 if lock acquired, 0 if timeout, NULL on error.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
 		$acquired = $wpdb->get_var(
-			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, 30 )
+			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, $lockout_duration )
 		);
 
-		if ( '1' !== $acquired ) {
-			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'woocommerce' ) );
+		// Check if the lock was not acquired.
+		if ( 1 !== (int) $acquired ) {
+			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'prevent-duplicate-orders' ) );
 		}
 
-		// Clear the SQL result cache.
-		$wpdb->flush();
-
-		// Use shared lockout duration.
-		$existing_order = self::find_recent_order( $cart_hash, $email );
-		if ( $existing_order ) {
-			self::release_lock();
-			throw new Exception(
-				sprintf(
-					/* translators: %d: order number */
-					esc_html__( 'Order #%d has already been placed. Please check your orders.', 'woocommerce' ),
-					(int) $existing_order
-				)
-			);
-		}
-	}
-
-	/**
-	 * Find an recent order created.
-	 *
-	 * @since 1.0.0
-	 *
-	 * @param string $cart_hash Cart hash to search for.
-	 * @param string $email     Customer email.
-	 *
-	 * @return int|null Order ID if found, null otherwise.
-	 */
-	private static function find_recent_order( $cart_hash, $email ) {
-		global $wpdb;
-
+		// Critical check: Ensure no order was created while waiting for the lock.
 		// Query HPOS tables - cart_hash is in operational_data table.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$lockout_duration = defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
-		$order_id         = $wpdb->get_var(
+		$time_threshold = gmdate( 'Y-m-d H:i:s', time() - $lockout_duration );
+		$existing_order = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT o.id FROM {$wpdb->prefix}wc_orders o
 				INNER JOIN {$wpdb->prefix}wc_order_operational_data od ON o.id = od.order_id
@@ -121,30 +107,47 @@ class Prevent_Duplicate_Orders {
 				AND o.billing_email = %s
 				AND o.date_created_gmt > %s
 				AND o.status IN ('wc-pending', 'wc-processing', 'wc-on-hold', 'wc-completed')
+				ORDER BY o.date_created_gmt DESC
 				LIMIT 1",
 				$cart_hash,
 				$email,
-				gmdate( 'Y-m-d H:i:s', time() - $lockout_duration )
+				$time_threshold
 			)
 		);
 
-		return $order_id ? (int) $order_id : null;
+		if ( $existing_order ) {
+			self::release_lock();
+			throw new Exception(
+				sprintf(
+					/* translators: %d: order number */
+					esc_html__( 'Order #%d has already been placed. Please check your orders.', 'prevent-duplicate-orders' ),
+					(int) $existing_order
+				)
+			);
+		}
 	}
 
 	/**
-	 * Release the database lock.
+	 * Release the acquired MySQL lock.
+	 *
+	 * This method ensures the lock is released using MySQL's RELEASE_LOCK()
+	 * function. It is safe to call multiple times as it checks if a lock key
+	 * is currently held before attempting release.
 	 *
 	 * @since 1.0.0
 	 */
 	public static function release_lock() {
+		global $wpdb;
+
 		if ( ! self::$lock_key ) {
 			return;
 		}
 
-		global $wpdb;
-
+		// RELEASE_LOCK() returns: 1 if released, 0 if lock wasn't held, NULL on error.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$wpdb->query( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::$lock_key ) );
+		$wpdb->get_var(
+			$wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::$lock_key )
+		);
 
 		self::$lock_key = null;
 	}
