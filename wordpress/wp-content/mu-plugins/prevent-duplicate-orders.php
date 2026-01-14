@@ -17,8 +17,7 @@ defined( 'ABSPATH' ) || exit;
  * Problem: Concurrent checkout requests (from retries, double-clicks, load balancers)
  * can create multiple orders because they all pass validation before any order exists.
  *
- * Solution: Uses WordPress transients with atomic database operations for locking that
- * works across all database connections (including HyperDB read replicas). After acquiring
+ * Solution: Uses MySQL GET_LOCK() for atomic, connection-specific locking. After acquiring
  * the lock, we check if an order was JUST created (within 60 seconds) with the same cart hash.
  * This catches concurrent requests while allowing legitimate repeat orders.
  *
@@ -52,6 +51,7 @@ class Prevent_Duplicate_Orders {
 	public static function init() {
 		if ( defined( 'WC_DUPLICATE_ORDER_FIX' ) && WC_DUPLICATE_ORDER_FIX ) {
 			add_action( 'woocommerce_checkout_process', [ __CLASS__, 'acquire_lock' ], 1 );
+			add_action( 'woocommerce_checkout_create_order', [ __CLASS__, 'check_duplicate_before_save' ], 1 );
 			add_action( 'woocommerce_checkout_order_created', [ __CLASS__, 'on_order_created' ], 99 );
 			register_shutdown_function( [ __CLASS__, 'release_lock' ] );
 		}
@@ -94,24 +94,18 @@ class Prevent_Duplicate_Orders {
 		// Process ID (useful for identifying concurrent requests on same server).
 		$info['process_id'] = getmypid();
 
-		// Database host (to identify which DB connection is being used).
+		// Database connection type.
 		global $wpdb;
 		if ( isset( $wpdb->dbh ) && is_resource( $wpdb->dbh ) ) {
-			$info['db_connection'] = 'active';
+			$info['db_connection'] = 'mysqli';
 		} elseif ( isset( $wpdb->dbh ) ) {
-			$info['db_connection'] = get_class( $wpdb->dbh );
+			$info['db_connection'] = is_object( $wpdb->dbh ) ? get_class( $wpdb->dbh ) : 'unknown';
+		} else {
+			$info['db_connection'] = 'mysqli';
 		}
 
-		// Check if HyperDB is being used.
-		if ( class_exists( 'hyperdb' ) && $wpdb instanceof hyperdb ) {
-			$info['db_type'] = 'HyperDB';
-			// Try to get current database connection info.
-			if ( isset( $wpdb->dbhname ) ) {
-				$info['db_connection_name'] = $wpdb->dbhname;
-			}
-		} else {
-			$info['db_type'] = 'Standard wpdb';
-		}
+		// Database type.
+		$info['db_type'] = 'Standard wpdb';
 
 		// Session information.
 		if ( WC()->session ) {
@@ -207,7 +201,7 @@ class Prevent_Duplicate_Orders {
 	/**
 	 * Acquire atomic lock at start of checkout.
 	 *
-	 * Uses WordPress transients with atomic database operations for locking.
+	 * Uses MySQL GET_LOCK() for atomic, connection-specific locking.
 	 *
 	 * @since 1.0.0
 	 *
@@ -246,74 +240,92 @@ class Prevent_Duplicate_Orders {
 			$cart_info
 		);
 
-		// Check if lock already exists.
-		$lock_check_start = microtime( true );
-		$existing_lock    = get_transient( self::$lock_key );
-		$lock_check_time  = microtime( true ) - $lock_check_start;
+		// Acquire MySQL lock atomically.
+		// GET_LOCK() returns: 1 if lock acquired, 0 if timeout, NULL on error.
+		global $wpdb;
+		$lock_acquire_start = microtime( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		$lock_result       = $wpdb->get_var(
+			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, $lockout_duration )
+		);
+		$lock_acquire_time = microtime( true ) - $lock_acquire_start;
 
-		if ( false !== $existing_lock ) {
+		self::log(
+			'Lock acquisition attempt',
+			[
+				'lock_result'          => $lock_result,
+				'lock_key'             => self::$lock_key,
+				'lockout_duration'     => $lockout_duration,
+				'lock_acquire_time_ms' => round( $lock_acquire_time * 1000, 2 ),
+			]
+		);
+
+		// Check lock result.
+		if ( 1 !== (int) $lock_result ) {
+			$error_msg = null === $lock_result
+				? 'Lock acquisition failed (database error)'
+				: 'Lock acquisition timeout - another request is processing this checkout';
+
 			self::log(
-				'Lock already exists, request blocked',
+				$error_msg,
 				[
-					'existing_lock_value' => $existing_lock,
-					'existing_lock_age'   => time() - (int) $existing_lock,
-					'lock_check_time_ms'  => round( $lock_check_time * 1000, 2 ),
+					'lock_result'          => $lock_result,
+					'lock_acquire_time_ms' => round( $lock_acquire_time * 1000, 2 ),
 				],
 				'warning'
 			);
 			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'woocommerce' ) );
 		}
 
-		// Acquire lock by setting transient.
-		$lock_set_start = microtime( true );
-		$lock_set       = set_transient( self::$lock_key, time(), $lockout_duration );
-		$lock_set_time  = microtime( true ) - $lock_set_start;
-
-		// Verify lock was actually set immediately after.
-		$verify_start = microtime( true );
-		$verify_lock  = get_transient( self::$lock_key );
-		$verify_time  = microtime( true ) - $verify_start;
-
 		self::log(
-			'Lock acquisition attempt',
+			'Lock acquired successfully',
 			[
-				'lock_set'         => $lock_set,
-				'lock_value'       => time(),
-				'lockout_duration' => $lockout_duration,
-				'lock_set_time_ms' => round( $lock_set_time * 1000, 2 ),
-				'verify_lock'      => $verify_lock,
-				'verify_time_ms'   => round( $verify_time * 1000, 2 ),
+				'cart_hash'                   => $cart_hash,
+				'email'                       => $email,
+				'time_since_lock_acquired_ms' => round( ( microtime( true ) - $lock_acquire_start ) * 1000, 2 ),
 			]
 		);
+	}
 
-		// Critical check: if lock was set but immediately not found, we have a problem.
-		if ( false === $verify_lock ) {
-			self::log(
-				'CRITICAL: Lock was set but immediately not found - possible race condition or DB replication lag',
-				[
-					'lock_set_result'  => $lock_set,
-					'lock_set_time_ms' => round( $lock_set_time * 1000, 2 ),
-					'verify_time_ms'   => round( $verify_time * 1000, 2 ),
-				],
-				'error'
-			);
-			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'woocommerce' ) );
+	/**
+	 * Check for duplicate order right before order is saved.
+	 * This runs in woocommerce_checkout_create_order hook, which fires
+	 * right before the order is saved to the database.
+	 *
+	 * @since 1.0.0
+	 *
+	 * @param WC_Order $order Order object (not yet saved).
+	 * @param array    $data  Checkout data.
+	 *
+	 * @throws Exception If duplicate order found.
+	 */
+	public static function check_duplicate_before_save( $order, $data ) {
+		if ( ! self::$lock_key ) {
+			// Lock wasn't acquired, skip duplicate check.
+			return;
 		}
 
-		// Check for duplicate order using the same lockout duration.
+		$cart_hash = WC()->cart ? WC()->cart->get_cart_hash() : '';
+		if ( empty( $cart_hash ) ) {
+			return;
+		}
+
+		$email            = isset( $data['billing_email'] ) ? sanitize_email( $data['billing_email'] ) : '';
+		$lockout_duration = self::get_lockout_duration();
+
+		// Check for duplicate order right before saving.
 		$duplicate_check_start = microtime( true );
 		$existing_order        = self::find_recent_order( $cart_hash, $email, $lockout_duration );
 		$duplicate_check_time  = microtime( true ) - $duplicate_check_start;
 
 		if ( $existing_order ) {
 			self::log(
-				'Duplicate order found, releasing lock',
+				'Duplicate order found right before save, releasing lock',
 				[
-					'existing_order_id'           => $existing_order,
-					'cart_hash'                   => $cart_hash,
-					'email'                       => $email,
-					'duplicate_check_time_ms'     => round( $duplicate_check_time * 1000, 2 ),
-					'time_since_lock_acquired_ms' => round( ( microtime( true ) - $lock_set_start ) * 1000, 2 ),
+					'existing_order_id'       => $existing_order,
+					'cart_hash'               => $cart_hash,
+					'email'                   => $email,
+					'duplicate_check_time_ms' => round( $duplicate_check_time * 1000, 2 ),
 				],
 				'warning'
 			);
@@ -328,18 +340,17 @@ class Prevent_Duplicate_Orders {
 		}
 
 		self::log(
-			'Lock acquired successfully, no duplicate orders found',
+			'Duplicate check passed, order will be saved',
 			[
-				'cart_hash'                   => $cart_hash,
-				'email'                       => $email,
-				'duplicate_check_time_ms'     => round( $duplicate_check_time * 1000, 2 ),
-				'time_since_lock_acquired_ms' => round( ( microtime( true ) - $lock_set_start ) * 1000, 2 ),
+				'cart_hash'               => $cart_hash,
+				'email'                   => $email,
+				'duplicate_check_time_ms' => round( $duplicate_check_time * 1000, 2 ),
 			]
 		);
 	}
 
 	/**
-	 * Find an recent order created.
+	 * Find a recent order created.
 	 *
 	 * @since 1.0.0
 	 *
@@ -376,28 +387,16 @@ class Prevent_Duplicate_Orders {
 		$query_time = microtime( true ) - $query_start;
 		$result     = $order_id ? (int) $order_id : null;
 
-		// Get database connection info for HyperDB debugging.
-		$db_info = [];
-		global $wpdb;
-		if ( class_exists( 'hyperdb' ) && $wpdb instanceof hyperdb && isset( $wpdb->dbhname ) ) {
-			$db_info['db_connection_name'] = $wpdb->dbhname;
-			$db_info['db_type']            = 'HyperDB';
-		}
-
 		self::log(
 			'Duplicate order check completed',
-			array_merge(
-				[
-					'cart_hash'      => $cart_hash,
-					'email'          => $email,
-					'time_threshold' => $time_threshold,
-					'found_order_id' => $result,
-					'query_time_ms'  => round( $query_time * 1000, 2 ),
-					'rows_affected'  => $wpdb->rows_affected ?? 'N/A',
-					'last_query'     => $wpdb->last_query ?? 'N/A',
-				],
-				$db_info
-			)
+			[
+				'cart_hash'      => $cart_hash,
+				'email'          => $email,
+				'time_threshold' => $time_threshold,
+				'found_order_id' => $result,
+				'query_time_ms'  => round( $query_time * 1000, 2 ),
+				'last_query'     => $wpdb->last_query ?? 'N/A',
+			]
 		);
 
 		return $result;
@@ -434,7 +433,7 @@ class Prevent_Duplicate_Orders {
 	}
 
 	/**
-	 * Release the transient lock.
+	 * Release the MySQL lock.
 	 *
 	 * @since 1.0.0
 	 */
@@ -443,17 +442,19 @@ class Prevent_Duplicate_Orders {
 			return;
 		}
 
-		// Verify lock still exists before releasing.
-		$lock_value   = get_transient( self::$lock_key );
-		$lock_deleted = delete_transient( self::$lock_key );
+		global $wpdb;
+		// RELEASE_LOCK() returns: 1 if released, 0 if lock wasn't held, NULL on error.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
+		$release_result = $wpdb->get_var(
+			$wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::$lock_key )
+		);
 
-		// Only log if we actually had a lock (not just shutdown cleanup for blocked requests).
-		if ( false !== $lock_value ) {
+		// Only log if we actually had a lock (release_result = 1).
+		if ( 1 === (int) $release_result ) {
 			self::log(
 				'Lock released successfully',
 				[
-					'lock_value_before_release' => $lock_value,
-					'lock_deleted'              => $lock_deleted,
+					'release_result' => $release_result,
 				]
 			);
 		}
