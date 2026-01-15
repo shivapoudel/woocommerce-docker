@@ -30,11 +30,14 @@ class Concurrent_Checkout_Tester {
 	const TEST_ORDER_META = '_cct_test_order';
 
 	/**
-	 * Whether the fix can be toggled via UI.
+	 * Whether the duplicate order fix can be toggled via the UI.
+	 *
+	 * Set to false when WC_DUPLICATE_ORDER_FIX is already defined,
+	 * preventing UI toggling since the constant takes precedence.
 	 *
 	 * @var bool
 	 */
-	private static $is_togglable = true;
+	private static $can_toggle = true;
 
 	/**
 	 * Initialize the plugin.
@@ -67,7 +70,7 @@ class Concurrent_Checkout_Tester {
 		if ( ! defined( 'WC_DUPLICATE_ORDER_FIX' ) ) {
 			define( 'WC_DUPLICATE_ORDER_FIX', ( $_COOKIE['wc_cct_fix_enabled'] ?? 'yes' ) !== 'no' );
 		} else {
-			self::$is_togglable = false;
+			self::$can_toggle = false;
 		}
 
 		// Tag test orders.
@@ -351,61 +354,6 @@ class Concurrent_Checkout_Tester {
 		);
 	}
 
-	/**
-	 * Check if there is a recent order for the current cart/customer.
-	 *
-	 * @since 1.0.0
-	 * @return array|null Order data if found, null otherwise.
-	 */
-	public static function get_recent_order_data() {
-		if ( defined( 'WC_DUPLICATE_ORDER_FIX' ) && ! WC_DUPLICATE_ORDER_FIX ) {
-			return null;
-		}
-
-		if ( ! WC()->cart || WC()->cart->is_empty() ) {
-			return null;
-		}
-
-		$cart_hash = WC()->cart->get_cart_hash();
-		if ( empty( $cart_hash ) ) {
-			return null;
-		}
-
-		$email = WC()->checkout->get_value( 'billing_email' );
-		if ( empty( $email ) ) {
-			return null;
-		}
-
-		global $wpdb;
-		// Look for order in HPOS with same cart hash and billing email within last window.
-		$table_orders     = $wpdb->prefix . 'wc_orders';
-		$table_operational = $wpdb->prefix . 'wc_order_operational_data';
-
-		$row = $wpdb->get_row(
-			$wpdb->prepare(
-				"SELECT o.id, UNIX_TIMESTAMP(o.date_created_gmt) as timestamp
-				FROM $table_orders AS o
-				INNER JOIN $table_operational AS op ON o.id = op.order_id
-				WHERE op.cart_hash = %s
-				AND o.billing_email = %s
-				AND o.status NOT IN ('wc-cancelled', 'wc-failed')
-				AND UNIX_TIMESTAMP(o.date_created_gmt) > %d
-				LIMIT 1",
-				$cart_hash,
-				$email,
-				time() - self::get_lockout_duration()
-			)
-		);
-
-		if ( ! $row ) {
-			return null;
-		}
-
-		return [
-			'id'        => (int) $row->id,
-			'timestamp' => (int) $row->timestamp,
-		];
-	}
 
 	/**
 	 * Tag order as test order.
@@ -433,7 +381,7 @@ class Concurrent_Checkout_Tester {
 		<div id="cct-panel" style="float:right;display:flex;flex-direction:column;width:100%;margin-top:20px;padding:16px;background:#fefce8;border:1px solid #fbbf24;border-radius:4px;box-sizing:border-box;">
 			<div class="cct-panel-header" style="display:flex;justify-content:space-between;align-items:center;width:100%;">
 				<span style="font-size:14px;font-weight:600;">Concurrent Test</span>
-				<?php if ( ! self::$is_togglable ) : ?>
+				<?php if ( ! self::$can_toggle ) : ?>
 					<span style="font-size:11px;padding:2px 8px;border-radius:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.025em;background:<?php echo $fix_enabled ? '#dcfce7' : '#fee2e2'; ?>;color:<?php echo $fix_enabled ? '#166534' : '#991b1b'; ?>;">
 						Fix <?php echo $fix_enabled ? 'ON' : 'OFF'; ?>
 					</span>
@@ -451,10 +399,9 @@ class Concurrent_Checkout_Tester {
 				<?php endif; ?>
 			</div>
 			<p style="margin:8px 0 0;font-size:12px;color:#92400e;line-height:1.4;">
-				Sends <?php echo esc_html( $requests ); ?> concurrent checkout requests. Stripe orders set to Processing status.
+				Sends <?php echo esc_html( $requests ); ?> concurrent checkout requests. Stripe orders are automatically set to Processing status. Note: New Stripe cards may fail in concurrent tests, but duplicate order prevention will still work correctly.
 			</p>
 			<button type="button" id="cct-run-test" class="button alt" style="width:100%;margin-top:10px;">Run Concurrent Test</button>
-			<div id="cct-lockout-notice" style="display:none;width:100%;"></div>
 			<div id="cct-results" style="display:flex;flex-wrap:wrap;width:100%;margin-top:10px;font-size:12px;line-height:1.5;gap:6px;"></div>
 		</div>
 		<?php
@@ -470,98 +417,311 @@ class Concurrent_Checkout_Tester {
 			return;
 		}
 
-		$requests      = defined( 'WC_CONCURRENT_CHECKOUT_REQUESTS' ) ? (int) WC_CONCURRENT_CHECKOUT_REQUESTS : 5;
-		$fix_enabled   = defined( 'WC_DUPLICATE_ORDER_FIX' ) && WC_DUPLICATE_ORDER_FIX;
-		$checkout_url  = wc_get_checkout_url();
-		$ajax_url      = admin_url( 'admin-ajax.php' );
-		$nonce         = wp_create_nonce( 'cct_nonce' );
+		$requests     = defined( 'WC_CONCURRENT_CHECKOUT_REQUESTS' ) ? (int) WC_CONCURRENT_CHECKOUT_REQUESTS : 5;
+		$checkout_url = wc_get_checkout_url();
+		$ajax_url     = admin_url( 'admin-ajax.php' );
+		$nonce        = wp_create_nonce( 'cct_nonce' );
 		?>
 		<script>
-		// Handle recent order locking and countdown.
+		// Test button click handler.
 		(function() {
-			const fixEnabled = <?php echo $fix_enabled ? 'true' : 'false'; ?>;
-			let countdownInterval = null;
-			let localRecentOrder = <?php echo ($recent = self::get_recent_order_data()) ? json_encode($recent) : 'null'; ?>;
-			let currentRemaining = 0;
-
-			// Calculate time offset once on page load.
-			const serverTimeAtLoad = <?php echo time(); ?>;
-			const clientTimeAtLoad = Math.floor(Date.now() / 1000);
-			const timeOffset = serverTimeAtLoad - clientTimeAtLoad;
-			const lockoutDuration = <?php echo (int) self::get_lockout_duration(); ?>;
-
-			window.cctUpdateLockout = (customData) => {
-				if (customData) localRecentOrder = customData;
-				const order = localRecentOrder;
-
-				if (!fixEnabled) {
-					toggleButtons(false);
-					return;
+			// Sync concurrent test button state with place order button.
+			function syncTestButton() {
+				const placeOrderBtn = document.getElementById('place_order');
+				const testBtn = document.getElementById('cct-run-test');
+				if (placeOrderBtn && testBtn) {
+					testBtn.disabled = placeOrderBtn.disabled;
 				}
-
-				if (countdownInterval) clearInterval(countdownInterval);
-				if (!order) {
-					toggleButtons(false);
-					return;
-				}
-
-				const disableButtons = () => {
-					const currentServerTime = Math.floor(Date.now() / 1000) + timeOffset;
-					const remaining = Math.min(lockoutDuration, Math.max(0, lockoutDuration - (currentServerTime - order.timestamp)));
-					currentRemaining = remaining;
-
-					const lockoutNotice = document.getElementById('cct-lockout-notice');
-
-					if (remaining > 0) {
-						toggleButtons(true);
-						if (lockoutNotice) {
-							const html = `<div style="display:flex;flex:1 1 100%;box-sizing:border-box;padding:10px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:4px;color:#991b1b;font-weight:600;margin-top:10px;align-items:center;gap:12px;"><span style="display:flex;align-items:center;justify-content:center;flex-shrink:0;width:20px;line-height:1;margin-top:-1px;">🚨</span><span style="flex:1;">Order #${order.id} has already been placed. Retry in ${remaining}s...</span></div>`;
-							if (lockoutNotice.innerHTML !== html) {
-								lockoutNotice.innerHTML = html;
-								lockoutNotice.style.display = 'flex';
-							}
-						}
-					} else {
-						toggleButtons(false);
-						if (lockoutNotice) {
-							lockoutNotice.innerHTML = '';
-							lockoutNotice.style.display = 'none';
-						}
-						if (countdownInterval) clearInterval(countdownInterval);
-					}
-				};
-
-				disableButtons();
-				countdownInterval = setInterval(disableButtons, 1000);
-			};
-
-			function toggleButtons(disabled) {
-				const btnMain = document.getElementById('place_order');
-				if (btnMain) btnMain.disabled = disabled;
 			}
 
-			// Initial run.
-			window.cctUpdateLockout();
+			// Initial sync and on checkout updates.
+			syncTestButton();
+			jQuery(document.body).on('updated_checkout', syncTestButton);
 
-			// Handle AJAX updates (re-apply current lockout state if any).
-			jQuery(document.body).on('updated_checkout', () => {
-				window.cctUpdateLockout();
-			});
-
-			// Test button click handler.
 			document.body.addEventListener('click', async function(e) {
 				if (!e.target.matches('#cct-run-test')) return;
 				e.preventDefault(); // Prevent default form submission if button is inside a form
 				const btn = e.target;
 				const results = document.getElementById('cct-results');
 
-				const REQUESTS = <?php echo (int) $requests; ?>;
-				const form = document.querySelector('form.checkout');
+				// Disable button immediately to prevent double-clicks
+				if (btn.disabled) return;
+				const originalText = btn.textContent;
+				btn.disabled = true;
+				btn.textContent = 'Preparing...';
 
-				if (!form) return alert('Checkout form not found');
+				try {
+					const REQUESTS = <?php echo (int) $requests; ?>;
+					const form = document.querySelector('form.checkout');
 
-				const formData = new URLSearchParams(new FormData(form)).toString();
-				const isStripe = form.querySelector('input[name="payment_method"]:checked')?.value?.includes('stripe');
+					if (!form) {
+						btn.disabled = false;
+						btn.textContent = originalText;
+						alert('Checkout form not found');
+						return;
+					}
+
+					// Check if user is logged in (required for saved cards).
+					const isLoggedIn = <?php echo is_user_logged_in() ? 'true' : 'false'; ?>;
+					if (!isLoggedIn) {
+						btn.disabled = false;
+						btn.textContent = originalText;
+						alert('Please log in to use saved payment methods.');
+						return;
+					}
+
+				// Collect all form data properly, including radio buttons and checkboxes.
+				const formDataObj = new FormData(form);
+
+				// For new cards with Stripe UPE, we need to create the payment method ID first.
+				// This is done by accessing the Stripe Elements instance and creating a payment method.
+				const paymentMethod = form.querySelector('input[name="payment_method"]:checked')?.value;
+				const isStripe = paymentMethod?.includes('stripe');
+				const isNewCard = isStripe && form.querySelector('input[name^="wc-"][name$="-payment-token"]:checked')?.value === 'new';
+
+				if (isNewCard) {
+					// For new cards with Stripe UPE, we need to create the payment method ID.
+					// Stripe UPE creates it when the form is submitted, but we're bypassing that.
+					// Try to create it programmatically from Stripe Elements.
+					const expectedPaymentMethodField = 'wc-' + paymentMethod + '-payment-method';
+					let paymentMethodCreated = false;
+
+					try {
+						// Get billing details
+						const billingDetails = {
+							name: ((form.querySelector('#billing_first_name')?.value || '').trim() + ' ' + (form.querySelector('#billing_last_name')?.value || '').trim()).trim(),
+							email: form.querySelector('#billing_email')?.value || '',
+							phone: form.querySelector('#billing_phone')?.value || '',
+							address: {
+								line1: form.querySelector('#billing_address_1')?.value || '',
+								line2: form.querySelector('#billing_address_2')?.value || '',
+								city: form.querySelector('#billing_city')?.value || '',
+								state: form.querySelector('#billing_state')?.value || '',
+								postal_code: form.querySelector('#billing_postcode')?.value || '',
+								country: form.querySelector('#billing_country')?.value || '',
+							}
+						};
+
+						// Try to access Stripe Elements through various methods
+						let paymentElement = null;
+						let stripeInstance = null;
+
+						// Get Stripe instance
+						if (window.wc_stripe && typeof window.wc_stripe.getStripe === 'function') {
+							stripeInstance = window.wc_stripe.getStripe();
+						} else if (window.wc_stripe_params && window.wc_stripe_params.key && window.Stripe) {
+							stripeInstance = window.Stripe(window.wc_stripe_params.key);
+						}
+
+						if (stripeInstance) {
+							// Try to find the payment element - check multiple possible locations
+							if (window.wc_stripe_upe_elements) {
+								paymentElement = window.wc_stripe_upe_elements.card?.upeElement ||
+								                window.wc_stripe_upe_elements.payment;
+							}
+
+							if (!paymentElement && window.wc_stripe && window.wc_stripe.elements) {
+								paymentElement = window.wc_stripe.elements.card?.upeElement ||
+								                window.wc_stripe.elements.payment;
+							}
+
+							if (!paymentElement && typeof jQuery !== 'undefined') {
+								const upeContainer = jQuery('.wc-stripe-upe-element, [data-payment-method-type]').first();
+								if (upeContainer.length) {
+									paymentElement = upeContainer.data('upe-element') || upeContainer.data('payment-element');
+								}
+							}
+
+							// If we found a payment element, create payment method from it
+							if (paymentElement) {
+								const paymentMethodResponse = await stripeInstance.createPaymentMethod({
+									type: 'card',
+									card: paymentElement,
+									billing_details: billingDetails
+								});
+
+								if (paymentMethodResponse && !paymentMethodResponse.error && paymentMethodResponse.paymentMethod && paymentMethodResponse.paymentMethod.id) {
+									formDataObj.set(expectedPaymentMethodField, paymentMethodResponse.paymentMethod.id);
+									paymentMethodCreated = true;
+								}
+							}
+						}
+
+						// Try window.wc_stripe.createPaymentMethod if available
+						if (!paymentMethodCreated && window.wc_stripe && typeof window.wc_stripe.createPaymentMethod === 'function') {
+							const paymentMethodResponse = await window.wc_stripe.createPaymentMethod({ billing_details: billingDetails });
+
+							if (paymentMethodResponse && !paymentMethodResponse.error && paymentMethodResponse.paymentMethod && paymentMethodResponse.paymentMethod.id) {
+								formDataObj.set(expectedPaymentMethodField, paymentMethodResponse.paymentMethod.id);
+								paymentMethodCreated = true;
+							}
+						}
+
+						if (!paymentMethodCreated) {
+							// Show helpful message but don't block - let test proceed
+							console.warn('Could not create payment method ID. Test may fail for new cards.');
+							// Continue anyway - the test will show errors if Stripe can't process it
+						}
+					} catch (error) {
+						console.warn('Error creating payment method:', error);
+						// Continue anyway - the test will show errors if Stripe can't process it
+					}
+				}
+
+				// Ensure all radio buttons and checkboxes are included (FormData only includes checked ones).
+				form.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach(input => {
+					if (input.name) {
+						if (input.type === 'radio' && input.checked) {
+							formDataObj.set(input.name, input.value);
+						} else if (input.type === 'checkbox' && input.checked) {
+							formDataObj.append(input.name, input.value);
+						}
+					}
+				});
+
+				// For Stripe, ensure payment method tokens/IDs are included.
+				// paymentMethod and isStripe are already declared above
+
+				if (isStripe && paymentMethod) {
+					// Expected field name: wc-{gateway_id}-payment-token
+					const expectedTokenField = 'wc-' + paymentMethod + '-payment-token';
+
+					// Find the checked payment token input for this specific gateway.
+					const tokenInputs = form.querySelectorAll(`input[name="${expectedTokenField}"], input[name^="wc-"][name$="-payment-token"]`);
+					let savedTokenInput = null;
+
+					// Find the checked token input (prefer exact match, fallback to any matching pattern).
+					tokenInputs.forEach(input => {
+						if (input.checked && input.value && input.value !== 'new') {
+							// Prefer exact field name match.
+							if (input.name === expectedTokenField) {
+								savedTokenInput = input;
+							} else if (!savedTokenInput) {
+								// Fallback to any matching token.
+								savedTokenInput = input;
+							}
+						}
+					});
+
+					if (savedTokenInput) {
+						// For saved cards, ensure the payment token is explicitly set with correct field name.
+						// Use the expected field name format even if the input has a slightly different name.
+						formDataObj.delete(expectedTokenField);
+						formDataObj.set(expectedTokenField, savedTokenInput.value);
+
+						// Also remove from any other field name variations.
+						if (savedTokenInput.name !== expectedTokenField) {
+							formDataObj.delete(savedTokenInput.name);
+						}
+					} else {
+						// If using new card, we need a payment method ID from Stripe Elements.
+						// For UPE, the field name is 'wc-stripe-payment-method' (or 'wc-{gateway_id}-payment-method').
+						const expectedPaymentMethodField = 'wc-' + paymentMethod + '-payment-method';
+
+						// Check various possible locations for the payment method ID.
+						let paymentMethodId =
+							form.querySelector(`input[name="${expectedPaymentMethodField}"]`)?.value ||
+							form.querySelector('input[name="wc-stripe-payment-method"]')?.value ||
+							form.querySelector('input[name="stripe_payment_method_id"]')?.value ||
+							form.querySelector('input[name="payment_method_id"]')?.value ||
+							form.querySelector('input[name="stripe-payment-method"]')?.value ||
+							form.querySelector('#stripe-payment-method-id')?.value ||
+							(window.stripePaymentMethodId && window.stripePaymentMethodId);
+
+						// Also check FormData (it might already be there).
+						const formDataPaymentMethodId = formDataObj.get(expectedPaymentMethodField) || formDataObj.get('wc-stripe-payment-method');
+
+						// Check if Stripe Elements has created a payment method ID.
+						// For UPE, the payment method might be stored in the Stripe instance.
+						if (!paymentMethodId && !formDataPaymentMethodId) {
+							// Try to get it from WooCommerce Stripe's global variables.
+							if (window.wc_stripe_params && window.wc_stripe_params.payment_method_id) {
+								paymentMethodId = window.wc_stripe_params.payment_method_id;
+							}
+
+							// Check for Stripe Elements instance and try to get payment method.
+							// WooCommerce Stripe UPE stores the payment method in various places.
+							if (!paymentMethodId) {
+								// Try accessing through jQuery if available (WooCommerce uses jQuery).
+								if (typeof jQuery !== 'undefined' && jQuery.fn.wc_stripe) {
+									try {
+										const stripeData = jQuery(form).data('stripe');
+										if (stripeData && stripeData.paymentMethodId) {
+											paymentMethodId = stripeData.paymentMethodId;
+										}
+									} catch (e) {
+										// Ignore errors
+									}
+								}
+
+								// Try accessing through window.wc_stripe if available.
+								if (!paymentMethodId && window.wc_stripe) {
+									try {
+										if (typeof window.wc_stripe.getPaymentMethod === 'function') {
+											const pm = window.wc_stripe.getPaymentMethod();
+											if (pm && pm.id) {
+												paymentMethodId = pm.id;
+											}
+										}
+										// Also check if there's a stored payment method ID.
+										if (!paymentMethodId && window.wc_stripe.paymentMethodId) {
+											paymentMethodId = window.wc_stripe.paymentMethodId;
+										}
+									} catch (e) {
+										// Ignore errors
+									}
+								}
+
+								// Check for hidden input that might be added by Stripe.
+								if (!paymentMethodId) {
+									const hiddenInputs = form.querySelectorAll('input[type="hidden"][name*="payment"], input[type="hidden"][name*="stripe"]');
+									hiddenInputs.forEach(input => {
+										if (input.value && input.value.startsWith('pm_')) {
+											paymentMethodId = input.value;
+										}
+									});
+								}
+							}
+						}
+
+						const finalPaymentMethodId = paymentMethodId || formDataPaymentMethodId;
+
+						// Set the payment method ID if we have it (and it's not empty).
+						// Note: Stripe UPE creates the payment method ID dynamically on form submission.
+						// If it's not found here, we must NOT send an empty value, as Stripe will try to fetch it and fail.
+						// Instead, we should either:
+						// 1. Not include the field at all (let Stripe create it)
+						// 2. Or ensure we have a valid payment method ID before submitting
+						if (finalPaymentMethodId && finalPaymentMethodId.trim() !== '') {
+							formDataObj.set(expectedPaymentMethodField, finalPaymentMethodId);
+						} else {
+							// Remove any empty payment method field to prevent Stripe from trying to fetch an empty ID.
+							formDataObj.delete(expectedPaymentMethodField);
+							formDataObj.delete('wc-stripe-payment-method');
+
+							// For new cards without a payment method ID, we need to ensure the token field is set to 'new'.
+							// This tells Stripe to create the payment method from the card details.
+							const tokenFieldName = 'wc-' + paymentMethod + '-payment-token';
+							if (!formDataObj.has(tokenFieldName)) {
+								formDataObj.set(tokenFieldName, 'new');
+							}
+						}
+
+						// Also ensure stripe_token is set if available.
+						const stripeToken = form.querySelector('input[name="stripe_token"]')?.value;
+						if (stripeToken && stripeToken !== 'new') {
+							formDataObj.set('stripe_token', stripeToken);
+						}
+
+						// For new cards, ensure 'new' is set for payment token if not already present.
+						const tokenFieldName = 'wc-' + paymentMethod + '-payment-token';
+						if (!formDataObj.has(tokenFieldName)) {
+							formDataObj.set(tokenFieldName, 'new');
+						}
+					}
+				}
+
+				const formData = new URLSearchParams(formDataObj).toString();
 
 				btn.disabled = true;
 				btn.textContent = 'Running...';
@@ -621,14 +781,6 @@ class Concurrent_Checkout_Tester {
 
 				results.innerHTML = html;
 
-				// Trigger immediate lockout if an order was created.
-				if (unique.length > 0) {
-					window.cctUpdateLockout({
-						id: unique[0],
-						timestamp: Math.floor(Date.now() / 1000)
-					});
-				}
-
 				// Auto-update to Processing for Stripe payments.
 				if (unique.length > 0 && isStripe) {
 					results.innerHTML += '<div style="display:flex;flex:1 1 100%;box-sizing:border-box;margin-top:8px;padding:10px 14px;background:#e7f3ff;border-radius:4px;align-items:center;gap:12px;"><span style="display:flex;align-items:center;justify-content:center;flex-shrink:0;width:20px;line-height:1;margin-top:-1px;">🔄</span><span style="flex:1;">Updating orders to Processing...</span></div>';
@@ -659,6 +811,14 @@ class Concurrent_Checkout_Tester {
 
 				btn.disabled = false;
 				btn.textContent = 'Run Concurrent Test';
+				} catch (error) {
+					console.error('Error in concurrent checkout test:', error);
+					btn.disabled = false;
+					btn.textContent = 'Run Concurrent Test';
+					if (results) {
+						results.innerHTML = '<div style="display:flex;flex:1 1 100%;box-sizing:border-box;padding:10px 14px;background:#f8d7da;border-radius:4px;align-items:center;gap:12px;"><span style="display:flex;align-items:center;justify-content:center;flex-shrink:0;width:20px;line-height:1;margin-top:-1px;">❌</span><span style="flex:1;">Error: ' + (error.message || 'Unknown error') + '</span></div>';
+					}
+				}
 			});
 
 			// Handle fix toggle using event delegation.
