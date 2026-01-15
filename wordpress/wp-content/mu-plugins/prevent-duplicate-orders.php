@@ -44,6 +44,7 @@ class Prevent_Duplicate_Orders {
 
 		// Registers actions to acquire/release locks during checkout.
 		add_action( 'woocommerce_checkout_process', [ __CLASS__, 'acquire_lock' ], 1 );
+		add_action( 'woocommerce_checkout_create_order', [ __CLASS__, 'check_duplicate_before_save' ], 1, 2 );
 		add_action( 'woocommerce_checkout_order_created', [ __CLASS__, 'release_lock' ], 99 );
 		register_shutdown_function( [ __CLASS__, 'release_lock' ] );
 	}
@@ -51,18 +52,15 @@ class Prevent_Duplicate_Orders {
 	/**
 	 * Acquire an atomic lock at the start of the checkout process.
 	 *
-	 * This method utilizes MySQL's GET_LOCK() function to enforce atomic,
-	 * connection-specific locking. This prevents race conditions where multiple
-	 * concurrent requests could otherwise validate and process the same cart
-	 * simultaneously.
-	 *
-	 * It also performs a critical check for existing orders created within the
-	 * configured lockout duration to block duplicate attempts.
+	 * Uses MySQL's GET_LOCK() to serialize concurrent checkout requests for the
+	 * same cart. After acquiring the lock, checks for duplicate orders created
+	 * within the configured time window (default 60 seconds) to prevent race
+	 * conditions where multiple requests pass validation before any order exists.
 	 *
 	 * @since 1.0.0
 	 *
-	 * @throws Exception If the lock cannot be obtained (timeout) or if a duplicate
-	 *                   order is detected immediately after acquiring the lock.
+	 * @throws Exception If the lock cannot be obtained (30s timeout) or if a
+	 *                   duplicate order is detected within the time window.
 	 */
 	public static function acquire_lock() {
 		global $wpdb;
@@ -80,33 +78,60 @@ class Prevent_Duplicate_Orders {
 		$email          = isset( $_POST['billing_email'] ) ? sanitize_email( wp_unslash( $_POST['billing_email'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification
 		self::$lock_key = 'wc_checkout_lock_' . md5( $cart_hash . $email );
 
-		// Get lockout duration.
-		$lockout_duration = defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
-
 		// Acquire MySQL lock atomically.
+		// GET_LOCK() timeout: 30 seconds (reasonable wait time if another request has the lock).
 		// GET_LOCK() returns: 1 if lock acquired, 0 if timeout, NULL on error.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
 		$acquired = $wpdb->get_var(
-			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, $lockout_duration )
+			$wpdb->prepare( 'SELECT GET_LOCK(%s, %d)', self::$lock_key, 30 )
 		);
 
 		// Check if the lock was not acquired.
-		if ( 1 !== (int) $acquired ) {
+		if ( '1' !== $acquired ) {
 			throw new Exception( esc_html__( 'Your order is being processed. Please wait.', 'prevent-duplicate-orders' ) );
 		}
+	}
 
-		// Critical check: Ensure no order was created while waiting for the lock.
-		// Query HPOS tables - cart_hash is in operational_data table.
+	/**
+	 * Check for duplicate order right before order is saved.
+	 *
+	 * This runs in woocommerce_checkout_create_order hook, which fires
+	 * right before the order is saved to the database. This is the critical
+	 * moment to check for duplicates, as it's the last chance before the
+	 * order is committed.
+	 *
+	 * @since 1.0.0
+	 *
+	 * @param WC_Order $order Order object (not yet saved).
+	 * @param array    $data  Checkout data.
+	 *
+	 * @throws Exception If duplicate order found.
+	 */
+	public static function check_duplicate_before_save( $order, $data ) {
+		global $wpdb;
+
+		if ( ! self::$lock_key ) {
+			return;
+		}
+
+		$cart_hash = WC()->cart ? WC()->cart->get_cart_hash() : '';
+		if ( empty( $cart_hash ) ) {
+			return;
+		}
+
+		$email            = isset( $data['billing_email'] ) ? sanitize_email( $data['billing_email'] ) : '';
+		$lockout_duration = defined( 'WC_DUPLICATE_ORDER_LOCKOUT_DURATION' ) ? (int) WC_DUPLICATE_ORDER_LOCKOUT_DURATION : 60;
+		$time_threshold   = gmdate( 'Y-m-d H:i:s', time() - $lockout_duration );
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery
-		$time_threshold = gmdate( 'Y-m-d H:i:s', time() - $lockout_duration );
 		$existing_order = $wpdb->get_var(
 			$wpdb->prepare(
 				"SELECT o.id FROM {$wpdb->prefix}wc_orders o
 				INNER JOIN {$wpdb->prefix}wc_order_operational_data od ON o.id = od.order_id
 				WHERE od.cart_hash = %s
-				AND o.billing_email = %s
-				AND o.date_created_gmt > %s
-				AND o.status IN ('wc-pending', 'wc-processing', 'wc-on-hold', 'wc-completed')
+					AND o.billing_email = %s
+					AND o.date_created_gmt > %s
+					AND o.status IN ('wc-pending', 'wc-failed', 'wc-processing', 'wc-on-hold', 'wc-completed')
 				ORDER BY o.date_created_gmt DESC
 				LIMIT 1",
 				$cart_hash,
@@ -119,9 +144,10 @@ class Prevent_Duplicate_Orders {
 			self::release_lock();
 			throw new Exception(
 				sprintf(
-					/* translators: %d: order number */
-					esc_html__( 'Order #%d has already been placed. Please check your orders.', 'prevent-duplicate-orders' ),
-					(int) $existing_order
+					/* translators: %1$d: order number, %2$d: lockout duration in seconds */
+					esc_html__( 'Order #%1$d already placed with same cart. Please wait %2$d seconds before placing a new order.', 'prevent-duplicate-orders' ),
+					(int) $existing_order,
+					(int) $lockout_duration
 				)
 			);
 		}
